@@ -1,0 +1,427 @@
+import { BasePlatformAdapter } from '../base.js'
+import { randomDelay, sleep, simulateBrowsing } from '../../core/human.js'
+import { cfg } from '../../core/config.js'
+import { PUBLISH_SELECTORS, INTERACT_SELECTORS } from './selectors.js'
+import path from 'path'
+
+/**
+ * 小红书发帖适配器
+ *
+ * 发帖页面: https://creator.xiaohongshu.com/publish/publish
+ *
+ * ⚠️ 重要：以下 CSS 选择器基于 2025 年页面结构，
+ *    如果小红书改版，需要手动更新这些选择器。
+ *    调试方法：在 Chrome 中打开发帖页面，按 F12 检查元素。
+ *
+ * 配置项:
+ *   steps.open_page.*        — 打开页面后的浏览时间
+ *   steps.upload_images.*    — 上传图片后的浏览时间
+ *   steps.input_title.*      — 输入标题后的浏览时间
+ *   steps.input_content.*    — 输入正文后的浏览时间
+ *   steps.add_tags.*         — 添加标签的延迟和浏览时间
+ *   steps.publish.*          — 发布前后的等待时间
+ *   upload.*                 — 文件上传轮询参数
+ *   screenshot.*             — 截图策略
+ *   tab.*                    — 发布后浏览和标签页关闭
+ */
+
+// 选择器引用自 ./selectors.js 集中管理
+const SELECTORS = PUBLISH_SELECTORS
+
+export class XiaohongshuAdapter extends BasePlatformAdapter {
+  constructor(page) {
+    super(page)
+    this.platformName = 'xiaohongshu'
+    // URL 必须带参数直接进入图文模式（2026-03 验证）
+    this.publishUrl = 'https://creator.xiaohongshu.com/publish/publish?from=tab_switch&target=image'
+  }
+
+  // 平台元数据
+  getHomeUrl() { return 'https://www.xiaohongshu.com/explore' }
+  getLoginUrl() { return 'https://creator.xiaohongshu.com/login' }
+  getInteractSelectors() { return INTERACT_SELECTORS }
+
+  /**
+   * 执行完整的发帖流程
+   */
+  async publish(post) {
+    this.log.info('========== 小红书发帖开始 ==========')
+    this.log.info(`标题: ${post.title}`)
+    this._dryRun = !!post.dryRun
+    if (this._dryRun) this.log.info('[dryRun] 审核模式：填写内容后不点击发布按钮')
+
+    try {
+      // 发帖前预热浏览：先浏览首页 feed，建立自然行为链
+      await this.warmupBrowse()
+
+      await this.step1_openPublishPage()
+
+      // 先上传图片 → 等待编辑器出现 → 再填标题/正文（顺序很重要）
+      if (post.images && post.images.length > 0) {
+        await this.step2_uploadImages(post.images)
+      }
+
+      await this.step3_inputTitle(post.title)
+      await this.step4_inputContent(post.content)
+
+      if (post.tags && post.tags.length > 0) {
+        await this.step5_addTags(post.tags)
+      }
+
+      // 内容类型声明（仅 AI 内容需要声明，正常原创内容跳过）
+      await this.step_declareOriginal(post)
+
+      // 定时发布（如果提供了 scheduleTime）
+      if (post.scheduleTime) {
+        await this.step_setScheduleTime(post.scheduleTime)
+      }
+
+      // AI 视觉验证：发布前截图确认内容正确
+      const verification = await this.verifyBeforePublish({
+        title: post.title,
+        content: post.content,
+        tags: post.tags,
+        imageCount: post.images?.length || 0
+      })
+      if (!verification.pass && verification.confidence > 0.8) {
+        if (this._dryRun) {
+          throw new Error(`[视觉验证] 内容验证未通过（置信度 ${verification.confidence}）: ${verification.details}\n问题: ${verification.issues.join('; ')}`)
+        }
+        this.log.warn(`[视觉验证] 内容验证未通过，但继续发布: ${verification.details}`)
+      }
+
+      await this.step6_publish()
+
+      // 补足时间到目标总时长
+      await this.fillRemainingTime()
+
+      // 发布后继续浏览（配置项: tab.post_publish_browse_min/max）
+      await this.postPublishBrowse()
+
+      this.log.info('========== 小红书发帖成功 ==========')
+      return { success: true, message: '发布成功' }
+
+    } catch (err) {
+      this.log.error(`小红书发帖失败: ${err.message}`)
+      await this.conditionalScreenshot('xhs_error', 'error')
+      return { success: false, message: err.message }
+    }
+  }
+
+  // ============================================================
+  // 各步骤实现 — 浏览时间全部从 config.steps.* 读取
+  // ============================================================
+
+  async step1_openPublishPage() {
+    this.log.info('[步骤1] 自然导航到发帖页面')
+
+    // 自然路径：创作者中心首页 → 短暂浏览 → 点击"发布笔记"
+    const creatorHome = 'https://creator.xiaohongshu.com/new/home'
+    try {
+      await this.navigateTo(creatorHome)
+
+      // 登录检测
+      const afterCreatorUrl = this.page.url()
+      if (afterCreatorUrl.includes(SELECTORS.loginPageIndicator)) {
+        throw new Error('未登录或登录已过期，请先在浏览器中登录小红书创作者中心')
+      }
+
+      // 在创作者中心短暂浏览（看看数据，像真人一样）
+      const creatorBrowseMs = Math.floor(cfg('timing.warmup_browse_min', 300) * 200) // 约 60s
+      await simulateBrowsing(this.page, this.cursor, Math.min(creatorBrowseMs, 90000))
+
+      // 尝试点击"发布笔记"按钮进入编辑页
+      const publishLink = await this.findByText('*', '发布笔记')
+      if (publishLink) {
+        this.log.info('[步骤1] 点击"发布笔记"按钮')
+        await this.clickElement(publishLink)
+        await randomDelay(2000, 4000)
+
+        // 检查是否成功导航到发帖页
+        const afterClickUrl = this.page.url()
+        if (afterClickUrl.includes('/publish')) {
+          this.log.info('[步骤1] 已通过自然导航到达发帖页')
+        } else {
+          // 点击后没到发帖页，fallback 到直接导航
+          this.log.info('[步骤1] 点击后未到达发帖页，fallback 到直接导航')
+          await this.navigateTo(this.publishUrl)
+        }
+      } else {
+        // 没找到发布按钮，fallback 到直接导航
+        this.log.info('[步骤1] 未找到"发布笔记"按钮，fallback 到直接导航')
+        await this.navigateTo(this.publishUrl)
+      }
+    } catch (err) {
+      // 自然导航失败，fallback 到直接 goto
+      if (err.message.includes('未登录')) throw err
+      this.log.warn(`[步骤1] 自然导航失败: ${err.message}，fallback 到直接导航`)
+      await this.navigateTo(this.publishUrl)
+    }
+
+    // 最终登录检测
+    const currentUrl = this.page.url()
+    if (currentUrl.includes(SELECTORS.loginPageIndicator)) {
+      throw new Error('未登录或登录已过期，请先在浏览器中登录小红书创作者中心')
+    }
+
+    await this.conditionalScreenshot('xhs_step1_open', 'step')
+    await this.browseForStep('open_page')
+  }
+
+  async step2_uploadImages(imagePaths) {
+    this.log.info(`[步骤2] 上传 ${imagePaths.length} 张图片`)
+
+    const absolutePaths = imagePaths.map(p => path.resolve(p))
+
+    const selector = await this.findSelector([
+      SELECTORS.uploadInput,
+      SELECTORS.uploadInputAlt,
+      SELECTORS.uploadInputFallback,
+    ])
+
+    await this.uploadFile(selector, absolutePaths)
+
+    // 等待图片处理 — 从 config.upload.* 读取
+    const pollInterval   = cfg('upload.processing_poll_interval', 5000)
+    const pollMaxAttempts = cfg('upload.processing_poll_max_attempts', 12)
+
+    this.log.info('等待图片处理...')
+    await sleep(pollInterval)
+
+    for (let i = 0; i < pollMaxAttempts; i++) {
+      const uploading = await this.page.$('.uploading, .progress')
+      if (!uploading) break
+      await sleep(pollInterval)
+    }
+
+    this.log.info('图片上传完成')
+    await this.conditionalScreenshot('xhs_step2_upload', 'step')
+    await this.browseForStep('upload_images')
+  }
+
+  async step3_inputTitle(title) {
+    this.log.info('[步骤3] 输入标题')
+
+    const selector = await this.findSelector([
+      SELECTORS.titleInput,
+      SELECTORS.titleInputAlt,
+      SELECTORS.titleInputFallback,
+    ])
+
+    // 标题是普通 <input>，keyboard.type 可靠
+    await this.type(selector, title)
+    await this.actionPause()
+    await this.conditionalScreenshot('xhs_step3_title', 'step')
+    await this.browseForStep('input_title')
+  }
+
+  async step4_inputContent(content) {
+    this.log.info('[步骤4] 输入正文')
+
+    const selector = await this.findSelector([
+      SELECTORS.contentInput,
+      SELECTORS.contentInputAlt,
+      SELECTORS.contentInputFallback,
+    ])
+
+    // ⚠️ 正文是 Tiptap/ProseMirror 富文本编辑器（contenteditable div）
+    // keyboard.type 对中文不可靠，必须用 CDP insertText
+    await this.paste(selector, content)
+    await this.actionPause()
+    await this.conditionalScreenshot('xhs_step4_content', 'step')
+    await this.browseForStep('input_content')
+  }
+
+  async step5_addTags(tags) {
+    this.log.info(`[步骤5] 添加 ${tags.length} 个话题标签`)
+
+    const selectDelayMin = cfg('steps.add_tags.select_delay_min', 2000)
+    const selectDelayMax = cfg('steps.add_tags.select_delay_max', 4000)
+
+    // 小红书话题通过编辑器内 # 触发建议下拉
+    // 点击 "# 话题" 按钮 → 在编辑器中插入 # → 输入关键词 → 点击建议项
+    for (const tag of tags) {
+      try {
+        // 1. 点击话题按钮（在编辑器中插入 #）
+        const topicBtn = await this.page.$(SELECTORS.tagButton || SELECTORS.topicButton)
+        if (!topicBtn) {
+          this.log.warn(`  未找到话题按钮，跳过标签 "${tag}"`)
+          continue
+        }
+        await topicBtn.click()
+        await sleep(500)
+
+        // 2. 输入话题关键词（CDP insertText，不含 #）
+        const cdp = await this.page.target().createCDPSession()
+        await cdp.send('Input.insertText', { text: tag })
+        await cdp.detach().catch(() => {})
+        this.log.info(`  输入话题: #${tag}`)
+        await randomDelay(selectDelayMin, selectDelayMax)
+
+        // 3. 点击建议下拉中的第一个匹配项
+        const suggHandle = await this.page.evaluateHandle((tagText) => {
+          // 建议项可能是多种元素，找包含话题文本的可点击元素
+          const allItems = Array.from(document.querySelectorAll(
+            '.tag-item, .topic-item, [class*="topic-list"] > *, [class*="suggest"] > *, [class*="dropdown"] > *'
+          )).filter(el => el.offsetParent !== null && el.textContent.includes('#'))
+
+          // 优先精确匹配
+          const exact = allItems.find(el => el.textContent.includes('#' + tagText))
+          if (exact) return exact
+
+          // fallback: 第一个可见的带 # 的建议
+          if (allItems.length > 0) return allItems[0]
+
+          // 最后 fallback: 任何含 tagText 且 cursor=pointer 的元素
+          return Array.from(document.querySelectorAll('*')).find(el => {
+            if (!el.offsetParent) return false
+            const r = el.getBoundingClientRect()
+            return el.textContent?.includes('#' + tagText)
+              && r.height > 20 && r.height < 60
+              && window.getComputedStyle(el).cursor === 'pointer'
+          }) || null
+        }, tag)
+
+        const suggEl = suggHandle.asElement()
+        if (suggEl) {
+          const text = await this.page.evaluate(el => el.textContent.trim().substring(0, 30), suggEl)
+          await suggEl.click()
+          this.log.info(`  选中话题: ${text}`)
+        } else {
+          // 无建议项时按 Enter 确认纯文本话题
+          await this.page.keyboard.press('Enter')
+          this.log.info(`  话题 "${tag}" Enter 确认`)
+        }
+        await sleep(800)
+
+      } catch (err) {
+        this.log.warn(`添加标签 "${tag}" 失败，跳过: ${err.message}`)
+        // 按 Escape 关闭残留弹窗
+        await this.page.keyboard.press('Escape').catch(() => {})
+        await sleep(300)
+      }
+    }
+
+    await this.conditionalScreenshot('xhs_step5_tags', 'step')
+    await this.browseForStep('add_tags')
+  }
+
+  /**
+   * 内容类型声明（2026-04 实测: 小红书已移除"原创声明"）
+   *
+   * 新 UI 为"添加内容类型声明"下拉，可选项:
+   *   - 虚构演绎，仅供娱乐
+   *   - 笔记含AI合成内容
+   *   - 内容包含营销广告
+   *   - 内容来源声明
+   *
+   * 正常原创内容: 无需选择任何声明，此步骤跳过
+   * AI 生成内容: 应声明"笔记含AI合成内容"（通过 post.declareAI = true 触发）
+   */
+  async step_declareOriginal(post) {
+    // 正常原创内容不需要声明（小红书已移除原创声明功能）
+    if (!post?.declareAI) {
+      this.log.info('[内容类型声明] 原创内容，无需声明，跳过')
+      return
+    }
+
+    this.log.info('[内容类型声明] AI 内容，声明"笔记含AI合成内容"')
+    try {
+      const selectEl = await this.findByText('*', SELECTORS.contentTypeSelectText || '添加内容类型声明')
+      if (!selectEl) {
+        this.log.warn('[内容类型声明] 未找到声明选择器，跳过')
+        return
+      }
+      await selectEl.click()
+      await randomDelay(1000, 2000)
+
+      const aiOption = await this.findByText('*', SELECTORS.contentTypeAIText || '笔记含AI合成内容')
+      if (aiOption) {
+        await aiOption.click()
+        await randomDelay(1000, 2000)
+        this.log.info('[内容类型声明] 已声明AI合成内容')
+      } else {
+        this.log.warn('[内容类型声明] 未找到AI合成内容选项')
+      }
+    } catch (err) {
+      this.log.warn(`[内容类型声明] 设置失败，跳过: ${err.message}`)
+    }
+  }
+
+  /**
+   * 定时发布
+   * @param {string} scheduleTime - ISO 时间字符串
+   */
+  async step_setScheduleTime(scheduleTime) {
+    this.log.info(`[定时发布] 设置发布时间: ${scheduleTime}`)
+    try {
+      // 定时发布在"更多设置"区域，通过文本查找 checkbox
+      const toggle = await this.findByText('*', SELECTORS.scheduleCheckboxText || '定时发布')
+      if (!toggle) {
+        this.log.warn('[定时发布] 未找到定时发布开关，跳过')
+        return
+      }
+      await toggle.click()
+      await randomDelay(1000, 2000)
+
+      const date = new Date(scheduleTime)
+      const dateStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+      const timeStr = `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
+
+      // 尝试填入日期和时间
+      const dateInput = await this.page.$(SELECTORS.scheduleDateInput)
+      if (dateInput) {
+        await dateInput.click({ clickCount: 3 })
+        await this.page.keyboard.type(dateStr)
+        await randomDelay(500, 1000)
+      }
+
+      const timeInput = await this.page.$(SELECTORS.scheduleTimeInput)
+      if (timeInput) {
+        await timeInput.click({ clickCount: 3 })
+        await this.page.keyboard.type(timeStr)
+        await randomDelay(500, 1000)
+      }
+
+      this.log.info(`[定时发布] 已设置: ${dateStr} ${timeStr}`)
+    } catch (err) {
+      this.log.warn(`[定时发布] 设置失败: ${err.message}`)
+    }
+  }
+
+  async step6_publish() {
+    if (this._dryRun) {
+      this.log.info('[步骤6] dryRun 模式，内容已填写，等待人工确认后手动点击发布')
+      return
+    }
+    this.log.info('[步骤6] 最终检查并发布')
+
+    const reviewDelayMin = cfg('steps.publish.review_delay_min', 3000)
+    const reviewDelayMax = cfg('steps.publish.review_delay_max', 8000)
+    const waitAfterMin   = cfg('steps.publish.wait_after_min', 5000)
+    const waitAfterMax   = cfg('steps.publish.wait_after_max', 15000)
+
+    // 上下滚动检查内容
+    await this.scroll()
+    await randomDelay(reviewDelayMin, reviewDelayMax)
+
+    // 发布前截图
+    await this.conditionalScreenshot('xhs_before_publish', 'before_publish')
+
+    // 发布按钮无可靠 CSS class（2026-04 实测），直接用文本匹配
+    const btn = await this.findByText('button', SELECTORS.publishButtonText || '发布')
+    if (!btn) {
+      throw new Error('未找到发布按钮，页面结构可能已变更')
+    }
+    await btn.click()
+
+    this.log.info('已点击发布按钮')
+
+    // 等待发布结果
+    await randomDelay(waitAfterMin, waitAfterMax)
+
+    // 发布后截图
+    await this.conditionalScreenshot('xhs_after_publish', 'after_publish')
+  }
+
+}
