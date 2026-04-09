@@ -6,7 +6,7 @@
 
 ### 报告问题
 
-在 [Issues](https://github.com/lchj2025/zenoclaw/issues) 中提交 bug 报告，请包含：
+在 [Issues](https://github.com/zenolore/zenoclaw/issues) 中提交 bug 报告，请包含：
 
 - 操作系统和 Node.js 版本
 - 复现步骤

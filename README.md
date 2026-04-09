@@ -53,7 +53,7 @@
 ### 1. Install
 
 ```bash
-git clone https://github.com/lchj2025/zenoclaw.git
+git clone https://github.com/zenolore/zenoclaw.git
 cd zenoclaw
 npm install
 
